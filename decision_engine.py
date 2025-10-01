@@ -35,6 +35,7 @@ DEFAULT_CONFIG = {
 # Optional: override thresholds via environment variables (for CI/CD / canary tuning)
 try:
     import os as _os
+
     _rej = _os.getenv("REJECT_AT")
     _rev = _os.getenv("REVIEW_AT")
     if _rej is not None:
@@ -44,30 +45,29 @@ try:
 except Exception:
     pass
 
+
 def is_night(hour: int) -> bool:
     return hour >= 22 or hour <= 5
+
 
 def high_amount(amount: float, product_type: str, thresholds: Dict[str, Any]) -> bool:
     t = thresholds.get(product_type, thresholds.get("_default"))
     return amount >= t
 
 
-def check_hard_block(row: pd.Series, cfg: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+def _check_hard_block(row: pd.Series, cfg: Dict[str, Any]) -> Dict[str, Any]:
     """Check for hard block conditions that immediately reject the transaction."""
     chargeback_count = int(row.get("chargeback_count", 0))
     ip_risk = str(row.get("ip_risk", "low")).lower()
 
     if chargeback_count >= cfg["chargeback_hard_block"] and ip_risk == "high":
-        return {
-            "decision": DECISION_REJECTED,
-            "risk_score": 100,
-            "reasons": "hard_block:chargebacks>=2+ip_high"
-        }
+        return {"decision": DECISION_REJECTED, "risk_score": 100, "reasons": "hard_block:chargebacks>=2+ip_high"}
+
     return None
 
 
-def calculate_categorical_risks(row: pd.Series, cfg: Dict[str, Any]) -> Tuple[int, List[str]]:
-    """Calculate risk scores for categorical fields."""
+def _calculate_categorical_risks(row: pd.Series, cfg: Dict[str, Any]) -> tuple[int, List[str]]:
+    """Calculate risk scores for categorical fields (IP, email, device fingerprint)."""
     score = 0
     reasons = []
 
@@ -87,32 +87,31 @@ def calculate_categorical_risks(row: pd.Series, cfg: Dict[str, Any]) -> Tuple[in
     return score, reasons
 
 
-def calculate_reputation_score(row: pd.Series, cfg: Dict[str, Any]) -> Tuple[int, List[str], str]:
-    """Calculate reputation-based risk score."""
+def _calculate_user_reputation_score(row: pd.Series, cfg: Dict[str, Any]) -> tuple[int, List[str]]:
+    """Calculate risk score based on user reputation."""
     rep = str(row.get("user_reputation", "new")).lower()
     rep_add = cfg["score_weights"]["user_reputation"].get(rep, 0)
     reasons = []
 
     if rep_add:
-        sign = '+' if rep_add >= 0 else ''
-        reasons.append(f"user_reputation:{rep}({sign}{rep_add})")
+        reasons.append(f"user_reputation:{rep}({('+' if rep_add >= 0 else '')}{rep_add})")
 
-    return rep_add, reasons, rep
+    return rep_add, reasons
 
 
-def calculate_time_and_geo_risks(row: pd.Series, cfg: Dict[str, Any]) -> Tuple[int, List[str]]:
-    """Calculate risks based on time and geographical factors."""
+def _calculate_behavioral_risks(row: pd.Series, cfg: Dict[str, Any]) -> tuple[int, List[str]]:
+    """Calculate risk scores for behavioral factors (time, geo, amount, latency)."""
     score = 0
     reasons = []
 
-    # Night hour risk
+    # Night hour check
     hr = int(row.get("hour", 12))
     if is_night(hr):
         add = cfg["score_weights"]["night_hour"]
         score += add
         reasons.append(f"night_hour:{hr}(+{add})")
 
-    # Geo mismatch risk
+    # Geo mismatch check
     bin_c = str(row.get("bin_country", "")).upper()
     ip_c = str(row.get("ip_country", "")).upper()
     if bin_c and ip_c and bin_c != ip_c:
@@ -120,15 +119,7 @@ def calculate_time_and_geo_risks(row: pd.Series, cfg: Dict[str, Any]) -> Tuple[i
         score += add
         reasons.append(f"geo_mismatch:{bin_c}!={ip_c}(+{add})")
 
-    return score, reasons
-
-
-def calculate_amount_and_latency_risks(row: pd.Series, cfg: Dict[str, Any], rep: str) -> Tuple[int, List[str]]:
-    """Calculate risks based on transaction amount and latency."""
-    score = 0
-    reasons = []
-
-    # High amount risk
+    # High amount check
     amount = float(row.get("amount_mxn", 0.0))
     ptype = str(row.get("product_type", "_default")).lower()
     if high_amount(amount, ptype, cfg["amount_thresholds"]):
@@ -136,12 +127,14 @@ def calculate_amount_and_latency_risks(row: pd.Series, cfg: Dict[str, Any], rep:
         score += add
         reasons.append(f"high_amount:{ptype}:{amount}(+{add})")
 
+        # Additional risk for new users with high amounts
+        rep = str(row.get("user_reputation", "new")).lower()
         if rep == "new":
             add2 = cfg["score_weights"]["new_user_high_amount"]
             score += add2
             reasons.append(f"new_user_high_amount(+{add2})")
 
-    # Extreme latency risk
+    # Extreme latency check
     lat = int(row.get("latency_ms", 0))
     if lat >= cfg["latency_ms_extreme"]:
         add = cfg["score_weights"]["latency_extreme"]
@@ -151,9 +144,9 @@ def calculate_amount_and_latency_risks(row: pd.Series, cfg: Dict[str, Any], rep:
     return score, reasons
 
 
-def apply_frequency_buffer(score: int, rep: str, row: pd.Series) -> Tuple[int, List[str]]:
+def _apply_frequency_buffer(row: pd.Series, score: int, reasons: List[str]) -> tuple[int, List[str]]:
     """Apply frequency buffer for trusted/recurrent users."""
-    reasons = []
+    rep = str(row.get("user_reputation", "new")).lower()
     freq = int(row.get("customer_txn_30d", 0))
 
     if rep in ("recurrent", "trusted") and freq >= 3 and score > 0:
@@ -163,7 +156,7 @@ def apply_frequency_buffer(score: int, rep: str, row: pd.Series) -> Tuple[int, L
     return score, reasons
 
 
-def determine_decision(score: int, cfg: Dict[str, Any]) -> str:
+def _determine_decision(score: int, cfg: Dict[str, Any]) -> str:
     """Determine final decision based on risk score."""
     if score >= cfg["score_to_decision"]["reject_at"]:
         return DECISION_REJECTED
@@ -174,48 +167,40 @@ def determine_decision(score: int, cfg: Dict[str, Any]) -> str:
 
 
 def assess_row(row: pd.Series, cfg: Dict[str, Any]) -> Dict[str, Any]:
-    """Main function to assess transaction risk."""
+    """Assess a transaction row and return decision, risk score, and reasons."""
     # Check for hard block conditions first
-    hard_block_result = check_hard_block(row, cfg)
+    hard_block_result = _check_hard_block(row, cfg)
     if hard_block_result:
         return hard_block_result
 
-    # Calculate risk scores from different categories
+    # Calculate risk scores from different factors
     score = 0
     all_reasons = []
 
     # Categorical risks
-    cat_score, cat_reasons = calculate_categorical_risks(row, cfg)
+    cat_score, cat_reasons = _calculate_categorical_risks(row, cfg)
     score += cat_score
     all_reasons.extend(cat_reasons)
 
-    # Reputation score
-    rep_score, rep_reasons, rep = calculate_reputation_score(row, cfg)
+    # User reputation
+    rep_score, rep_reasons = _calculate_user_reputation_score(row, cfg)
     score += rep_score
     all_reasons.extend(rep_reasons)
 
-    # Time and geo risks
-    time_geo_score, time_geo_reasons = calculate_time_and_geo_risks(row, cfg)
-    score += time_geo_score
-    all_reasons.extend(time_geo_reasons)
-
-    # Amount and latency risks
-    amount_lat_score, amount_lat_reasons = calculate_amount_and_latency_risks(row, cfg, rep)
-    score += amount_lat_score
-    all_reasons.extend(amount_lat_reasons)
+    # Behavioral risks
+    behavior_score, behavior_reasons = _calculate_behavioral_risks(row, cfg)
+    score += behavior_score
+    all_reasons.extend(behavior_reasons)
 
     # Apply frequency buffer
-    score, buffer_reasons = apply_frequency_buffer(score, rep, row)
-    all_reasons.extend(buffer_reasons)
+    score, all_reasons = _apply_frequency_buffer(row, score, all_reasons)
 
     # Determine final decision
-    decision = determine_decision(score, cfg)
+    decision = _determine_decision(score, cfg)
 
-    return {
-        "decision": decision,
-        "risk_score": int(score),
-        "reasons": ";".join(all_reasons)
-    }
+    return {"decision": decision, "risk_score": int(score), "reasons": ";".join(all_reasons)}
+
+
 def run(input_csv: str, output_csv: str, config: Dict[str, Any] = None) -> pd.DataFrame:
     cfg = config or DEFAULT_CONFIG
     df = pd.read_csv(input_csv)
@@ -230,6 +215,7 @@ def run(input_csv: str, output_csv: str, config: Dict[str, Any] = None) -> pd.Da
     out.to_csv(output_csv, index=False)
     return out
 
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--input", required=False, default="transactions_examples.csv", help="Path to input CSV")
@@ -237,6 +223,7 @@ def main():
     args = ap.parse_args()
     out = run(args.input, args.output)
     print(out.head().to_string(index=False))
+
 
 if __name__ == "__main__":
     main()
