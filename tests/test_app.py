@@ -10,6 +10,7 @@ from fastapi.testclient import TestClient
 #   from src.app import app as fastapi_app
 from app import app as fastapi_app
 
+#Cliente de prueba para la aplicación FastAPI
 client = TestClient(fastapi_app)
 
 
